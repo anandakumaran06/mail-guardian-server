@@ -18,12 +18,13 @@ class HeaderRequest(BaseModel):
     header: str
 
 
+# ---------- BASIC FIELD EXTRACT ----------
 def extract(pattern, text):
     match = re.search(pattern, text, re.IGNORECASE)
     return match.group(1).strip() if match else "N/A"
 
 
-# ---------------- DOMAIN REPUTATION ----------------
+# ---------- DOMAIN REPUTATION ----------
 TRUSTED_TLDS = [".gov", ".edu"]
 COMMON_MAIL_PROVIDERS = ["gmail.com", "outlook.com", "yahoo.com", "icloud.com"]
 KNOWN_BRANDS = ["sbi", "paypal", "amazon", "google", "microsoft", "apple"]
@@ -37,52 +38,98 @@ def domain_reputation(sender_line: str):
     email = match.group(1).lower()
     domain = email.split("@")[-1]
 
-    # trusted government/education
     if any(domain.endswith(tld) for tld in TRUSTED_TLDS):
         return "Trusted", "Official organization domain"
 
-    # common providers
     if domain in COMMON_MAIL_PROVIDERS:
         return "Neutral", "Public email provider"
 
-    # brand impersonation check
     name_part = sender_line.lower()
     for brand in KNOWN_BRANDS:
         if brand in name_part and brand not in domain:
             return "Suspicious", f"Brand name '{brand}' does not match domain"
 
-    # random suspicious domain patterns
     if re.search(r"\d{3,}|-|secure|login|verify", domain):
-        return "Suspicious", "Domain looks auto‑generated or phishing‑style"
+        return "Suspicious", "Domain looks auto-generated or phishing-style"
 
     return "Unknown", "No strong indicators"
 
 
-# ---------------- PHISHING SCORE ----------------
-
-def detect_phishing(header: str):
+# ---------- HEADER PHISHING CHECK ----------
+def header_phishing(header: str):
     h = header.lower()
     score = 0
     reasons = []
 
-    keywords = [
-        "verify", "urgent", "suspend", "immediately", "click",
-        "login", "password", "bank", "account blocked",
-        "lottery", "winner", "reward", "free", "otp"
+    if "spf=fail" in h or "dkim=fail" in h or "dmarc=fail" in h:
+        score += 40
+        reasons.append("Email authentication failed (SPF/DKIM/DMARC)")
+
+    if "received:" not in h:
+        score += 20
+        reasons.append("Header routing information missing")
+
+    return score, reasons
+
+
+# ---------- TEXT SCAM DETECTION (SCREENSHOT SUPPORT) ----------
+def text_scam_detection(text: str):
+    words = [
+        "urgent", "verify", "suspend", "click", "reward",
+        "lottery", "winner", "bank", "blocked",
+        "update kyc", "password", "otp", "limited time"
     ]
 
-    for k in keywords:
-        if k in h:
-            score += 12
-            reasons.append(f"Suspicious word detected: {k}")
+    score = 0
+    reasons = []
 
-    if "spf=fail" in h or "dkim=fail" in h:
-        score += 35
-        reasons.append("Authentication failure detected (SPF/DKIM)")
+    for w in words:
+        if w in text.lower():
+            score += 10
+            reasons.append(f"Suspicious phrase: {w}")
 
-    if "http://" in h or "bit.ly" in h or "tinyurl" in h:
+    if "http://" in text.lower():
         score += 20
-        reasons.append("Shortened or insecure link detected")
+        reasons.append("Unsecured link detected")
+
+    return score, reasons
+
+
+# ---------- MAIN ANALYSIS ----------
+@app.post("/analyze")
+def analyze_email(request: HeaderRequest):
+    data = request.header
+
+    # detect if input is real header or normal message
+    is_header = "received:" in data.lower() or "subject:" in data.lower()
+
+    score = 0
+    reasons = []
+
+    if is_header:
+        subject = extract(r"Subject:(.*)", data)
+        sender = extract(r"From:(.*)", data)
+        receiver = extract(r"To:(.*)", data)
+        date = extract(r"Date:(.*)", data)
+
+        h_score, h_reasons = header_phishing(data)
+        score += h_score
+        reasons.extend(h_reasons)
+
+        reputation, rep_note = domain_reputation(sender)
+
+    else:
+        subject = "Screenshot Text"
+        sender = "Unknown"
+        receiver = "User"
+        date = "N/A"
+        reputation = "Unknown"
+        rep_note = "Detected from screenshot message"
+
+    # common text detection for both
+    t_score, t_reasons = text_scam_detection(data)
+    score += t_score
+    reasons.extend(t_reasons)
 
     if score >= 70:
         risk = "High"
@@ -94,26 +141,6 @@ def detect_phishing(header: str):
     if not reasons:
         reasons.append("No suspicious indicators found")
 
-    return risk, reasons, score
-
-
-@app.get("/")
-def root():
-    return {"status": "Mail Guardian Analyzer Running"}
-
-
-@app.post("/analyze")
-def analyze_email(request: HeaderRequest):
-    header = request.header
-
-    subject = extract(r"Subject:(.*)", header)
-    sender = extract(r"From:(.*)", header)
-    receiver = extract(r"To:(.*)", header)
-    date = extract(r"Date:(.*)", header)
-
-    risk, reasons, score = detect_phishing(header)
-    reputation, rep_reason = domain_reputation(sender)
-
     return {
         "subject": subject,
         "from": sender,
@@ -123,6 +150,11 @@ def analyze_email(request: HeaderRequest):
         "score": score,
         "reasons": reasons,
         "domain_reputation": reputation,
-        "domain_note": rep_reason,
+        "domain_note": rep_note,
         "checked_at": datetime.utcnow().isoformat()
     }
+
+
+@app.get("/")
+def root():
+    return {"status": "Mail Guardian Online Backend Running"}
